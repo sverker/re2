@@ -4,7 +4,11 @@
 
 #include <erl_nif.h>
 
-#include <re2/re2.h>
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
+
+#include <string.h>
+
 #include <map>
 #include <vector>
 #include <memory>
@@ -24,7 +28,7 @@
 namespace {
 struct compileoptions
 {
-    re2::RE2::Options re2opts;
+    uint32_t pcre2opts;
 };
 
 struct matchoptions
@@ -45,7 +49,7 @@ struct matchoptions
     };
 
     bool caseless;
-    int offset;
+    PCRE2_SIZE offset;
     value_spec vs;
     capture_type ct;
     ERL_NIF_TERM vlist;
@@ -72,29 +76,20 @@ struct replaceoptions
 // placement syntax which necessitates explicit invocation of the object's
 // destructor. This is used in the NIF resource cleanup callback and in a
 // unique_ptr's deleter.
-template <typename T>
-void cleanup_obj_ptr(T*& ptr)
+void cleanup_obj_ptr(pcre2_code*& ptr)
 {
     if (ptr != nullptr) {
-        ptr->~T();
-        enif_free(ptr);
-        ptr = nullptr;
+      pcre2_code_free(ptr);
+      ptr = nullptr;
     }
 }
 
-// Deleter for use with enif allocated C++ object owned by a unique_ptr.
-template <typename T>
-struct EnifDeleter
-{
-    void operator()(T* ptr) { cleanup_obj_ptr(ptr); }
-};
-using Re2UniquePtr = std::unique_ptr<re2::RE2, EnifDeleter<re2::RE2>>;
 }  // namespace
 
-struct re2_handle
+struct re_handle
 {
     // RE2 objects are thread safe. no locking required.
-    re2::RE2* re;
+  pcre2_code* re;
 };
 
 //
@@ -103,62 +98,20 @@ struct re2_handle
 // emit the warning.
 // TODO: Reconsider use of union once gcc-4.1 is obsolete?
 //
-union re2_handle_union
+union re_handle_union
 {
     void* vp;
-    re2_handle* p;
+    re_handle* p;
 };
 
-#if ERL_NIF_MAJOR_VERSION > 2                                                 \
-    || (ERL_NIF_MAJOR_VERSION == 2 && ERL_NIF_MINOR_VERSION >= 7)
-#define NIF_FUNC_ENTRY(name, arity, fun)                                      \
-    {                                                                         \
-        name, arity, fun, 0                                                   \
-    }
-#else
-#define NIF_FUNC_ENTRY(name, arity, fun)                                      \
-    {                                                                         \
-        name, arity, fun                                                      \
-    }
-#endif
 
-#if ERL_NIF_MAJOR_VERSION > 2
-# define RE2_HAVE_DIRTY_SCHEDULERS 1
-#elif ERL_NIF_MAJOR_VERSION == 2
-# if ERL_NIF_MINOR_VERSION >= 7 && ERL_NIF_MINOR_VERSION < 11
-#  ifdef ERL_NIF_DIRTY_SCHEDULER_SUPPORT
-#   define RE2_HAVE_DIRTY_SCHEDULERS 1
-#  endif
-# elif ERL_NIF_MINOR_VERSION >= 11
-#  define RE2_HAVE_DIRTY_SCHEDULERS 1
-# else
-#  undef RE2_HAVE_DIRTY_SCHEDULERS
-# endif
-#endif
 
-#undef RE2_HAVE_DIRTY_SCHEDULERS
+#if 0
 
-#ifdef RE2_HAVE_DIRTY_SCHEDULERS
-
-static bool have_online_dirty_schedulers()
-{
-    ErlNifSysInfo si;
-    enif_system_info(&si, sizeof(si));
-    DBG("dirty_scheduler_support: " << si.dirty_scheduler_support << "\n");
-    return si.dirty_scheduler_support != 0;
-}
-
-#define DS_MODE ERL_NIF_DIRTY_JOB_CPU_BOUND
 #define SCHEDULE_NIF enif_schedule_nif
 
 #else
 
-static bool have_online_dirty_schedulers()
-{
-    return false;
-}
-
-#define DS_MODE 0
 static ERL_NIF_TERM SCHEDULE_NIF(
     ErlNifEnv* env,
     const char*,  // fun_name
@@ -172,8 +125,7 @@ static ERL_NIF_TERM SCHEDULE_NIF(
 #endif
 
 // static variables
-static int ds_flags                          = 0;
-static ErlNifResourceType* re2_resource_type = nullptr;
+static ErlNifResourceType* re_resource_type = nullptr;
 static ERL_NIF_TERM a_ok;
 static ERL_NIF_TERM a_error;
 static ERL_NIF_TERM a_match;
@@ -194,6 +146,11 @@ static ERL_NIF_TERM a_err_enif_alloc_resource;
 static ERL_NIF_TERM a_err_enif_alloc;
 static ERL_NIF_TERM a_err_enif_get_atom;
 static ERL_NIF_TERM a_err_enif_get_string;
+static ERL_NIF_TERM a_extended;
+static ERL_NIF_TERM a_dotall;
+static ERL_NIF_TERM a_multiline;
+
+/*
 static ERL_NIF_TERM a_re2_NoError;
 static ERL_NIF_TERM a_re2_ErrorInternal;
 static ERL_NIF_TERM a_re2_ErrorBadEscape;
@@ -209,7 +166,7 @@ static ERL_NIF_TERM a_re2_ErrorBadPerlOp;
 static ERL_NIF_TERM a_re2_ErrorBadUTF8;
 static ERL_NIF_TERM a_re2_ErrorBadNamedCapture;
 static ERL_NIF_TERM a_re2_ErrorPatternTooLarge;
-//static ERL_NIF_TERM a_unicode;
+*/
 
 static void init_atoms(ErlNifEnv* env)
 {
@@ -233,6 +190,11 @@ static void init_atoms(ErlNifEnv* env)
     a_err_enif_alloc             = enif_make_atom(env, "enif_alloc");
     a_err_enif_get_atom          = enif_make_atom(env, "enif_get_atom");
     a_err_enif_get_string        = enif_make_atom(env, "enif_get_string");
+    a_extended                   = enif_make_atom(env, "extended");
+    a_dotall                     = enif_make_atom(env, "dotall");
+    a_multiline                  = enif_make_atom(env, "multiline");
+
+    /*
     a_re2_NoError                = enif_make_atom(env, "no_error");
     a_re2_ErrorInternal          = enif_make_atom(env, "internal");
     a_re2_ErrorBadEscape         = enif_make_atom(env, "bad_escape");
@@ -248,10 +210,10 @@ static void init_atoms(ErlNifEnv* env)
     a_re2_ErrorBadUTF8           = enif_make_atom(env, "bad_utf8");
     a_re2_ErrorBadNamedCapture   = enif_make_atom(env, "bad_named_capture");
     a_re2_ErrorPatternTooLarge   = enif_make_atom(env, "pattern_too_large");
-    //    a_unicode                    = enif_make_atom(env, "unicode");
+    */
 }
 
-static void cleanup_handle(re2_handle* handle)
+static void cleanup_handle(re_handle* handle)
 {
     cleanup_obj_ptr(handle->re);
 }
@@ -267,9 +229,9 @@ static ERL_NIF_TERM error(ErlNifEnv* env, const ERL_NIF_TERM err)
 //
 // convert RE2 error code to error term
 //
-static ERL_NIF_TERM re2error(ErlNifEnv* env, const re2::RE2& re)
+static ERL_NIF_TERM make_error(ErlNifEnv* env, int error_code, PCRE2_SIZE error_offset)
 {
-    ERL_NIF_TERM code;
+  /*ERL_NIF_TERM code;
 
     switch (re.error_code()) {
     case re2::RE2::ErrorInternal:  // Unexpected error
@@ -320,14 +282,11 @@ static ERL_NIF_TERM re2error(ErlNifEnv* env, const re2::RE2& re)
         code = a_re2_NoError;
         break;
     }
+    */
 
-    ERL_NIF_TERM error
-        = enif_make_string(env, re.error().c_str(), ERL_NIF_LATIN1);
-    ERL_NIF_TERM error_arg
-        = enif_make_string(env, re.error_arg().c_str(), ERL_NIF_LATIN1);
-
-    return enif_make_tuple2(
-        env, a_error, enif_make_tuple3(env, code, error, error_arg));
+    return enif_make_tuple3(env, a_error,
+			    enif_make_int(env, error_code),
+			    enif_make_uint(env, (unsigned)error_offset));
 }
 
 static char* alloc_atom(ErlNifEnv* env, const ERL_NIF_TERM atom, unsigned* len)
@@ -359,7 +318,7 @@ static char* alloc_str(ErlNifEnv* env, const ERL_NIF_TERM list, unsigned* len)
 // Option = caseless | {max_mem, int()}
 //
 static bool parse_compile_options(
-    ErlNifEnv* env, const ERL_NIF_TERM list, re2::RE2::Options& opts)
+    ErlNifEnv* env, const ERL_NIF_TERM list, uint32_t* opts)
 {
     if (enif_is_empty_list(env, list))
         return true;
@@ -370,13 +329,14 @@ static bool parse_compile_options(
         const ERL_NIF_TERM* tuple;
         int tuplearity = -1;
 
-        if (enif_is_identical(H, a_caseless)) {
-
-            // caseless
-
-            opts.set_case_sensitive(false);
-	// } else if (H == a_unicode) {
-	//     opts.set_encoding(re2::RE2::Options::EncodingUTF8);
+        if (H == a_caseless) {
+	  *opts |= PCRE2_CASELESS;
+	} else if (H == a_extended) {
+	  *opts |= PCRE2_EXTENDED;
+	} else if (H == a_dotall) {
+	  *opts |= PCRE2_DOTALL;
+	} else if (H == a_multiline) {
+	  *opts |= PCRE2_MULTILINE;
         } else if (enif_get_tuple(env, H, &tuplearity, &tuple)) {
 
             if (tuplearity == 2) {
@@ -387,7 +347,7 @@ static bool parse_compile_options(
 
                     int max_mem = 0;
                     if (enif_get_int(env, tuple[1], &max_mem))
-                        opts.set_max_mem(max_mem);
+		      ;//opts.set_max_mem(max_mem);
                     else
                         return false;
                 }
@@ -400,53 +360,47 @@ static bool parse_compile_options(
     return true;
 }
 
-static ERL_NIF_TERM re2_compile_impl(
+static ERL_NIF_TERM compile_impl(
     ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     ErlNifBinary pdata;
 
-    if (enif_inspect_iolist_as_binary(env, argv[0], &pdata)) {
-        const re2::StringPiece p((const char*)pdata.data, pdata.size);
-        re2_handle* handle = (re2_handle*)enif_alloc_resource(
-            re2_resource_type, sizeof(re2_handle));
-
-        if (handle == nullptr) {
-            return error(env, a_err_enif_alloc_resource);
-        }
-
-        handle->re = nullptr;
-
-        re2::RE2::Options re2opts;
-        re2opts.set_log_errors(false);
-	//re2opts.set_encoding(re2::RE2::Options::EncodingLatin1);
-
-        if (argc == 2 && !parse_compile_options(env, argv[1], re2opts)) {
-            cleanup_handle(handle);
-            enif_release_resource(handle);
-            return enif_make_badarg(env);
-        }
-
-        re2::RE2* re2 = (re2::RE2*)enif_alloc(sizeof(re2::RE2));
-        if (re2 == nullptr) {
-            cleanup_handle(handle);
-            enif_release_resource(handle);
-            return error(env, a_err_enif_alloc);
-        }
-        handle->re = new (re2) re2::RE2(p, re2opts);  // placement new
-
-        if (!handle->re->ok()) {
-            ERL_NIF_TERM error = re2error(env, *(handle->re));
-            cleanup_handle(handle);
-            enif_release_resource(handle);
-            return error;
-        }
-
-        ERL_NIF_TERM result = enif_make_resource(env, handle);
-        enif_release_resource(handle);
-        return enif_make_tuple2(env, a_ok, result);
-    } else {
-        return enif_make_badarg(env);
+    if (!enif_inspect_iolist_as_binary(env, argv[0], &pdata)) {
+      return enif_make_badarg(env);
     }
+
+    re_handle* handle = (re_handle*)enif_alloc_resource(re_resource_type,
+							sizeof(re_handle));
+
+    if (handle == nullptr) {
+      return error(env, a_err_enif_alloc_resource);
+    }
+
+    handle->re = nullptr;
+
+    uint32_t pcre2opts = 0;
+
+    if (argc == 2 && !parse_compile_options(env, argv[1], &pcre2opts)) {
+      cleanup_handle(handle);
+      enif_release_resource(handle);
+      return enif_make_badarg(env);
+    }
+
+    int error_code;
+    PCRE2_SIZE error_offset;
+    handle->re = pcre2_compile_8(pdata.data, pdata.size, pcre2opts,
+				 &error_code, &error_offset, NULL);
+
+    if (handle->re == nullptr) {
+      ERL_NIF_TERM error = make_error(env, error_code, error_offset);
+      cleanup_handle(handle);
+      enif_release_resource(handle);
+      return error;
+    }
+
+    ERL_NIF_TERM result = enif_make_resource(env, handle);
+    enif_release_resource(handle);
+    return enif_make_tuple2(env, a_ok, result);
 }
 
 // =========
@@ -467,7 +421,7 @@ static void parse_match_capture_options(
         if (enif_is_atom(env, tuple[1]) > 0) {
 
             if (enif_is_identical(tuple[1], a_all))
-                opts.vs = matchoptions::VS_ALL;
+	      opts.vs = matchoptions::VS_ALL;
             else if (enif_is_identical(tuple[1], a_all_but_first))
                 opts.vs = matchoptions::VS_ALL_BUT_FIRST;
             else if (enif_is_identical(tuple[1], a_first))
@@ -477,7 +431,8 @@ static void parse_match_capture_options(
 
             vs_set = true;
         }
-    } else if (!enif_is_empty_list(env, tuple[1])) {
+    }
+    /*else if (!enif_is_empty_list(env, tuple[1])) {
 
         // ValueSpec = ValueList
         // ValueList = [ ValueID ]
@@ -486,7 +441,7 @@ static void parse_match_capture_options(
         opts.vlist = tuple[1];
         vs_set     = true;
         opts.vs    = matchoptions::VS_VLIST;
-    }
+    }*/
 
     // Type = index | binary
 
@@ -520,33 +475,21 @@ static bool parse_match_options(
         const ERL_NIF_TERM* tuple;
         int tuplearity = -1;
 
-        if (enif_is_identical(H, a_caseless)) {
+	if (enif_get_tuple(env, H, &tuplearity, &tuple)) {
 
-            // caseless
-
-            opts.caseless = true;
-        } else if (enif_get_tuple(env, H, &tuplearity, &tuple)) {
-
-            if (tuplearity == 2 || tuplearity == 3) {
-
-                // {offset,N} or {capture,ValueSpec}
-
-                if (enif_is_identical(tuple[0], a_offset)) {
-
-                    // {offset, int()}
-
-                    int offset = 0;
-                    if (enif_get_int(env, tuple[1], &offset)) {
-                        opts.offset = offset;
-                    } else {
-                        return false;
-                    }
-                } else if (enif_is_identical(tuple[0], a_capture)) {
-
-                    // {capture,ValueSpec,Type}
-                    parse_match_capture_options(env, opts, tuple, tuplearity);
-                }
-            }
+	  if (tuplearity == 2 && tuple[0] == a_offset) {
+	    // {offset, int()}
+	    unsigned int offset;
+	    if (!enif_get_uint(env, tuple[1], &offset)) {
+	      return false;
+	    }
+	    opts.offset = offset;
+	  }
+	  else if ((tuplearity == 2 || tuplearity == 3)
+		   && tuple[0] == a_capture) {
+	    // {capture,ValueSpec,Type}
+	    parse_match_capture_options(env, opts, tuple, tuplearity);
+	  }
         } else {
             return false;
         }
@@ -560,32 +503,36 @@ static bool parse_match_options(
 //
 static ERL_NIF_TERM mres(
     ErlNifEnv* env,
-    const re2::StringPiece& str,
-    const re2::StringPiece& match,
+    const ErlNifBinary* subj,
+    PCRE2_SIZE match_start,
+    PCRE2_SIZE match_end,
     const matchoptions::capture_type ct)
 {
-    switch (ct) {
-    case matchoptions::CT_BINARY:
-        ErlNifBinary bmatch;
-        if (!enif_alloc_binary(match.size(), &bmatch))
-            return a_err_enif_alloc_binary;
-        memcpy(bmatch.data, match.data(), match.size());
-        return enif_make_binary(env, &bmatch);
-    default:
-    case matchoptions::CT_INDEX:
-        int l, r;
-        if (match.data() == NULL) {
-            l = -1;
-            r = 0;
-        } else {
-            l = match.data() - str.data();
-            r = match.size();
-        }
-        return enif_make_tuple2(
-            env, enif_make_int(env, l), enif_make_int(env, r));
+  PCRE2_SIZE match_size = match_end - match_start;
+
+  switch (ct) {
+  case matchoptions::CT_BINARY: {
+    ERL_NIF_TERM bin_term;
+    unsigned char *dst = enif_make_new_binary(env, match_size, &bin_term);
+    // if PCRE2_UNSET match_size_will be zero
+    memcpy(dst, subj->data + match_start, match_size);
+    return bin_term;
+  }
+  case matchoptions::CT_INDEX:
+  default:
+    int l, r;
+    if (match_start == PCRE2_UNSET) {
+      l = -1;
+      r = 0;
+    } else {
+      l = match_start;
+      r = match_size;
     }
+    return enif_make_tuple2(env, enif_make_int(env, l), enif_make_int(env, r));
+  }
 }
 
+/*
 static ERL_NIF_TERM re2_match_ret_vlist(
     ErlNifEnv* env,
     const re2::RE2& re,
@@ -690,6 +637,7 @@ static ERL_NIF_TERM re2_match_ret_vlist(
     ERL_NIF_TERM list = enif_make_list_from_array(env, &vec[0], vec.size());
     return enif_make_tuple2(env, a_match, list);
 }
+*/
 
 //
 // Get number of capturing groups we want to request from RE2.
@@ -710,127 +658,80 @@ static int number_of_capturing_groups(
     }
 }
 
-static ERL_NIF_TERM re2_match_impl(
+static ERL_NIF_TERM match_impl(
     ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
-    ErlNifBinary sdata;
+    ErlNifBinary subj;
 
-    if (enif_inspect_iolist_as_binary(env, argv[0], &sdata)) {
-        const re2::StringPiece s((const char*)sdata.data, sdata.size);
-        re2::RE2* re               = nullptr;
-        Re2UniquePtr re_unique_ptr = nullptr;
-        union re2_handle_union handle;
-        ErlNifBinary pdata;
-
-        matchoptions opts(env);
-        if (argc == 3 && !parse_match_options(env, argv[2], opts))
-            return enif_make_badarg(env);
-
-        if (enif_get_resource(env, argv[1], re2_resource_type, &handle.vp)
-            && handle.p->re != nullptr) {
-            // Save existing RE2 obj for use in this function
-            re = handle.p->re;
-
-            if (opts.caseless)  // caseless allowed either in compile or match
-                return enif_make_badarg(env);
-        } else if (enif_inspect_iolist_as_binary(env, argv[1], &pdata)) {
-            const re2::StringPiece p((const char*)pdata.data, pdata.size);
-            re2::RE2::Options re2opts;
-            re2opts.set_log_errors(false);
-            if (opts.caseless)
-                re2opts.set_case_sensitive(false);
-            re2::RE2* re2 = (re2::RE2*)enif_alloc(sizeof(re2::RE2));
-            if (re2 == nullptr)
-                return error(env, a_err_enif_alloc);
-            // Save temporary RE2 obj for use in this function
-            re = new (re2) re2::RE2(p, re2opts);  // placement new
-            // Save RE2 obj ptr for cleanup via unique_ptr
-            re_unique_ptr.reset(re);
-        } else {
-            return enif_make_badarg(env);
-        }
-
-        if (!re->ok())
-            return enif_make_badarg(env);
-
-        // nr_groups must be the number of capturing groups + 1 because
-        // group[0] will be the text matched by the entire pattern, group[1]
-        // will be the first capturing group et cetera (assuming n >= 2), if
-        // there are any capturing groups in the regex and opts.vs causes us to
-        // request them.
-        const int nr_groups = re->NumberOfCapturingGroups() + 1;
-        const int n         = number_of_capturing_groups(nr_groups, opts.vs);
-        std::vector<re2::StringPiece> group;
-        group.reserve(n);
-
-        if (re->Match(
-                s,
-                opts.offset,
-                s.size(),
-                re2::RE2::UNANCHORED,
-                group.data(),
-                n)) {
-
-            int start = 0;
-            int arrsz = n;
-
-            if (opts.vs == matchoptions::VS_NONE) {
-
-                // return match atom only
-
-                return a_match;
-            } else if (opts.vs == matchoptions::VS_FIRST) {
-
-                // return first match only
-
-                ERL_NIF_TERM first = mres(env, s, group[0], opts.ct);
-                if (enif_is_identical(first, a_err_enif_alloc_binary)) {
-                    return error(env, a_err_enif_alloc_binary);
-                } else {
-                    return enif_make_tuple2(
-                        env, a_match, enif_make_list1(env, first));
-                }
-            } else if (opts.vs == matchoptions::VS_ALL_BUT_FIRST) {
-                // skip first match
-                start = 1;
-                arrsz--;
-            }
-
-            if (opts.vs == matchoptions::VS_VLIST) {
-
-                // return matched subpatterns as specified in ValueList
-
-                return re2_match_ret_vlist(env, *re, s, opts, group, n);
-            } else {
-
-                // return all or all_but_first matches
-
-                ERL_NIF_TERM* arr
-                    = (ERL_NIF_TERM*)enif_alloc(sizeof(ERL_NIF_TERM) * n);
-                for (int i = start, arridx = 0; i < n; i++, arridx++) {
-                    ERL_NIF_TERM res = mres(env, s, group[i], opts.ct);
-                    if (enif_is_identical(res, a_err_enif_alloc_binary)) {
-                        enif_free(arr);
-                        return error(env, a_err_enif_alloc_binary);
-                    } else {
-                        arr[arridx] = res;
-                    }
-                }
-
-                ERL_NIF_TERM list = enif_make_list_from_array(env, arr, arrsz);
-                enif_free(arr);
-
-                return enif_make_tuple2(env, a_match, list);
-            }
-        } else {
-
-            return a_nomatch;
-        }
-    } else {
-
-        return enif_make_badarg(env);
+    if (!enif_inspect_iolist_as_binary(env, argv[0], &subj)) {
+      return enif_make_badarg(env);
     }
+
+    pcre2_code* re             = nullptr;
+    union re_handle_union handle;
+    ErlNifBinary pdata;
+
+    matchoptions opts(env);
+    if (argc == 3 && !parse_match_options(env, argv[2], opts)) {
+      return enif_make_badarg(env);
+    }
+
+    if (enif_get_resource(env, argv[1], re_resource_type, &handle.vp)
+	&& handle.p->re != nullptr) {
+      // Save existing RE2 obj for use in this function
+      re = handle.p->re;
+    }
+    else {
+      return enif_make_badarg(env);
+    }
+
+    pcre2_match_data *match_data;
+
+    match_data = pcre2_match_data_create_from_pattern(handle.p->re, NULL);
+
+    if (0 > pcre2_match(handle.p->re, subj.data, subj.size, opts.offset,
+			0, match_data, NULL)) {
+	 return a_nomatch;
+    }
+
+    int first_ix = 0;
+    int last_ix = 2 * (pcre2_get_ovector_count(match_data) - 1);
+
+    const PCRE2_SIZE* ovec = pcre2_get_ovector_pointer(match_data);
+
+    if (opts.vs == matchoptions::VS_NONE) {
+      // return match atom only
+      return a_match;
+    }
+    else if (opts.vs == matchoptions::VS_FIRST) {
+      // return first match only
+      ERL_NIF_TERM first = mres(env, &subj, ovec[0], ovec[1], opts.ct);
+      if (enif_is_identical(first, a_err_enif_alloc_binary)) {
+	return error(env, a_err_enif_alloc_binary);
+      } else {
+	return enif_make_tuple2(env, a_match, enif_make_list1(env, first));
+      }
+    } else if (opts.vs == matchoptions::VS_ALL_BUT_FIRST) {
+      // skip first match
+      first_ix = 2;
+    }
+
+    /*if (opts.vs == matchoptions::VS_VLIST) {
+      // return matched subpatterns as specified in ValueList
+      return re2_match_ret_vlist(env, *re, s, opts, group, n);
+      }*/
+
+    // return all or all_but_first matches
+
+    ERL_NIF_TERM list = enif_make_list(env, 0);
+    for (int i = last_ix; i >= first_ix; i -= 2) {
+      ERL_NIF_TERM res = mres(env, &subj, ovec[i], ovec[i+1], opts.ct);
+      list = enif_make_list_cell(env, res, list);
+    }
+    return enif_make_tuple2(env, a_match, list);
 }
+
+/*****************'
 
 // ===========
 // re2:replace
@@ -843,20 +744,19 @@ static ERL_NIF_TERM re2_match_impl(
 static bool parse_replace_options(
     ErlNifEnv* env, const ERL_NIF_TERM list, replaceoptions& opts)
 {
-    if (enif_is_empty_list(env, list))
-        return true;
-
-    ERL_NIF_TERM L, H, T;
-
-    for (L = list; enif_get_list_cell(env, L, &H, &T); L = T) {
-
-        if (enif_is_identical(H, a_global))
-            opts.global = true;
-        else
-            return false;
-    }
-
+  if (enif_is_empty_list(env, list))
     return true;
+
+  ERL_NIF_TERM L, H, T;
+
+  for (L = list; enif_get_list_cell(env, L, &H, &T); L = T) {
+
+    if (H == a_global)
+      opts.global = true;
+    else
+      return false;
+  }
+  return true;
 }
 
 //
@@ -929,42 +829,51 @@ static ERL_NIF_TERM re2_replace_impl(
     }
 }
 
-extern "C" {
-static ERL_NIF_TERM re2_compile(
-    ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
-{
-    return SCHEDULE_NIF(
-        env, "compile", ds_flags, &re2_compile_impl, argc, argv);
-}
-
-static ERL_NIF_TERM re2_match(
-    ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
-{
-    return SCHEDULE_NIF(env, "match", ds_flags, &re2_match_impl, argc, argv);
-}
-
 static ERL_NIF_TERM re2_replace(
     ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     return SCHEDULE_NIF(
-        env, "replace", ds_flags, &re2_replace_impl, argc, argv);
+        env, "replace", ERL_NIF_DIRTY_JOB_CPU_BOUND, &re2_replace_impl, argc, argv);
 }
 
+****************/
+
+
+extern "C" {
+static ERL_NIF_TERM compile(
+    ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    return SCHEDULE_NIF(
+        env, "compile", ERL_NIF_DIRTY_JOB_CPU_BOUND, &compile_impl, argc, argv);
+}
+
+static ERL_NIF_TERM match(
+    ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    return SCHEDULE_NIF(env, "match", ERL_NIF_DIRTY_JOB_CPU_BOUND, &match_impl, argc, argv);
+}
+
+
+#define NIF_FUNC_ENTRY(name, arity, fun)                                      \
+    {                                                                         \
+        name, arity, fun, 0                                                   \
+    }
+
 static ErlNifFunc nif_funcs[] = {
-    NIF_FUNC_ENTRY("compile", 1, re2_compile),
-    NIF_FUNC_ENTRY("compile", 2, re2_compile),
-    NIF_FUNC_ENTRY("match", 2, re2_match),
-    NIF_FUNC_ENTRY("match", 3, re2_match),
-    NIF_FUNC_ENTRY("run", 2, re2_match),
-    NIF_FUNC_ENTRY("run", 3, re2_match),
-    NIF_FUNC_ENTRY("replace", 3, re2_replace),
-    NIF_FUNC_ENTRY("replace", 4, re2_replace),
+    NIF_FUNC_ENTRY("compile", 1, compile),
+    NIF_FUNC_ENTRY("compile", 2, compile),
+    NIF_FUNC_ENTRY("match", 2, match),
+    NIF_FUNC_ENTRY("match", 3, match),
+    NIF_FUNC_ENTRY("run", 2, match),
+    NIF_FUNC_ENTRY("run", 3, match)
+    //NIF_FUNC_ENTRY("replace", 3, replace),
+    //NIF_FUNC_ENTRY("replace", 4, replace),
 };
 
-static void re2_resource_cleanup(ErlNifEnv*, void* arg)
+static void re_resource_cleanup(ErlNifEnv*, void* arg)
 {
-    // Release any dynamically allocated memory stored in re2_handle
-    re2_handle* handle = (re2_handle*)arg;
+    // Release any dynamically allocated memory stored in re_handle
+    re_handle* handle = (re_handle*)arg;
     cleanup_handle(handle);
 }
 
@@ -974,24 +883,17 @@ static int on_load(ErlNifEnv* env, void**, ERL_NIF_TERM)
         = (ErlNifResourceFlags)(ERL_NIF_RT_CREATE | ERL_NIF_RT_TAKEOVER);
 
     ErlNifResourceType* rt = enif_open_resource_type(
-        env, nullptr, "re2_resource", &re2_resource_cleanup, flags, nullptr);
+        env, nullptr, "pcre2_resource", &re_resource_cleanup, flags, nullptr);
 
     if (rt == nullptr)
         return -1;
 
-    re2_resource_type = rt;
+    re_resource_type = rt;
 
     init_atoms(env);
-
-    if (have_online_dirty_schedulers()) {
-        DBG("dirty schedulers: online\n");
-        ds_flags = DS_MODE;
-    } else {
-        DBG("dirty schedulers: offline or unsupported\n");
-    }
 
     return 0;
 }
 
-ERL_NIF_INIT(re2, nif_funcs, &on_load, nullptr, nullptr, nullptr)
+ERL_NIF_INIT(pcre2, nif_funcs, &on_load, nullptr, nullptr, nullptr)
 }  // extern "C"
