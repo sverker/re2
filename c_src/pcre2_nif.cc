@@ -48,6 +48,7 @@ struct matchoptions
         CT_BINARY
     };
 
+    uint32_t flags;
     bool caseless;
     PCRE2_SIZE offset;
     value_spec vs;
@@ -55,13 +56,14 @@ struct matchoptions
     ERL_NIF_TERM vlist;
 
     matchoptions(ErlNifEnv* env)
-    : caseless(false)
-    , offset(0)
-    , vs(VS_ALL)
-    , ct(CT_INDEX)
-    {
-        vlist = enif_make_list(env, 0);
-    }
+      : flags(0)
+      , caseless(false)
+      , offset(0)
+      , vs(VS_ALL)
+      , ct(CT_INDEX)
+  {
+    vlist = enif_make_list(env, 0);
+  }
 };
 
 struct replaceoptions
@@ -149,6 +151,8 @@ static ERL_NIF_TERM a_err_enif_get_string;
 static ERL_NIF_TERM a_extended;
 static ERL_NIF_TERM a_dotall;
 static ERL_NIF_TERM a_multiline;
+static ERL_NIF_TERM a_notbol;
+static ERL_NIF_TERM a_noteol;
 
 /*
 static ERL_NIF_TERM a_re2_NoError;
@@ -193,6 +197,8 @@ static void init_atoms(ErlNifEnv* env)
     a_extended                   = enif_make_atom(env, "extended");
     a_dotall                     = enif_make_atom(env, "dotall");
     a_multiline                  = enif_make_atom(env, "multiline");
+    a_notbol                     = enif_make_atom(env, "notbol");
+    a_noteol                     = enif_make_atom(env, "noteol");
 
     /*
     a_re2_NoError                = enif_make_atom(env, "no_error");
@@ -475,7 +481,13 @@ static bool parse_match_options(
         const ERL_NIF_TERM* tuple;
         int tuplearity = -1;
 
-	if (enif_get_tuple(env, H, &tuplearity, &tuple)) {
+	if (H == a_notbol) {
+	  opts.flags |= PCRE2_NOTBOL;
+	}
+	else if (H == a_noteol) {
+	  opts.flags |= PCRE2_NOTEOL;
+	}
+	else if (enif_get_tuple(env, H, &tuplearity, &tuple)) {
 
 	  if (tuplearity == 2 && tuple[0] == a_offset) {
 	    // {offset, int()}
@@ -690,7 +702,7 @@ static ERL_NIF_TERM match_impl(
     match_data = pcre2_match_data_create_from_pattern(handle.p->re, NULL);
 
     if (0 > pcre2_match(handle.p->re, subj.data, subj.size, opts.offset,
-			0, match_data, NULL)) {
+			opts.flags, match_data, NULL)) {
 	 return a_nomatch;
     }
 
