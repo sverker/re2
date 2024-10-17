@@ -108,8 +108,8 @@ match(_,_,_) ->
 
 %% @doc Alias for ``match/2''.
 -spec run(Subject::subject(), Regex::regex()) -> match_result().
-run(_,_) ->
-    ?nif_stub.
+run(Subj, RE) ->
+    run(Subj, RE, []).
 
 %% @doc Alias for ``match/3''.
 -spec run(Subject::subject(), Regex::regex(),
@@ -122,15 +122,35 @@ run(Subj, RE, Opts0) ->
 	    Opts1 = lists:delete(global, Opts0),
 	    case lists:keytake(offset, 1, Opts1) of
 		false ->
-		    run_global(Subj, RE, , [])
-
-		    {0, Opts0};
-		{value, {offset, Offset}, Opts1} ->
-		    {Offset, Opts1}
+		    run_global(Subj, RE, Opts1, 0, []);
+		{value, {offset, Offset}, Opts2} ->
+		    run_global(Subj, RE, Opts2, Offset, [])
 	    end
     end.
 
-run_global(Subj
+run_global(Subj, RE, Opts, Offset, Acc) ->
+    io:format("run_global(~p, RE, ~p, ~p, ~p)\n", [Subj,Opts,Offset,Acc]),
+    receive after 10 -> ok end,
+    case match(Subj, RE, [{offset,Offset} | Opts]) of
+	{match, [{Start,Size}|_]=Captured} ->
+	    NextOffset = case Start+Size of
+			     Offset ->
+				 Offset+1;
+			     _ ->
+				 Start+Size
+			 end,
+	    run_global(Subj, RE, Opts, NextOffset, [Captured|Acc]);
+	nomatch ->
+	    case Acc of
+		[] ->
+		    nomatch;
+		_ ->
+		    {match, lists:reverse(Acc)}
+	    end;
+	{error, _}=Error ->
+	    Error
+    end.
+
 
 %% @doc Same as calling ``replace(Subject, Regex, Replacement, [])''.
 -spec replace(Subject::subject(), Regex::regex(),
